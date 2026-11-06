@@ -118,6 +118,27 @@ def _resolve_vertex_region() -> str:
         or "global"
     )
 
+
+def _resolve_thinking(types_mod):
+    """``GAP_VLM_THINKING_LEVEL`` (minimal/low/medium/high; Gemini 3.x) or
+    ``GAP_VLM_THINKING_BUDGET`` (an int; 0 turns thinking off on 2.5 Flash)
+    -> a ``ThinkingConfig``; ``None`` (the model's own default) when unset.
+
+    Unset, Gemini 2.5/3.x Flash think dynamically, and their thought tokens
+    count against ``max_output_tokens``: a long think on an A/B sheet can
+    leave a truncated prose reply (finish_reason MAX_TOKENS) that the
+    tournament reads as "B". The amount of thinking also varies call to call
+    at temperature 0, which is where the same sheet's answer flips.
+    """
+    level = _envstr("GAP_VLM_THINKING_LEVEL").upper()
+    budget = _envstr("GAP_VLM_THINKING_BUDGET")
+    if level:
+        return types_mod.ThinkingConfig(thinking_level=level)
+    if budget:
+        return types_mod.ThinkingConfig(thinking_budget=int(budget))
+    return None
+
+
 _MAX_TOKENS = 1024  # ported from the source servicer
 _MAX_RETRIES = 3
 _BACKOFF_S = 1.0
@@ -241,6 +262,25 @@ def _is_claude_model(model: str) -> bool:
     return "claude" in model.lower()
 
 
+_VERTEX_CLIENTS: dict[tuple[str, str], object] = {}
+
+
+def _vertex_client(genai_mod, project_id: str, region: str):
+    """One ``genai.Client`` per (project, region) for the server's lifetime.
+
+    A fresh client per call opens a new TLS connection and fetches an access
+    token on its first request: ~0.6 s on top of a ~0.9 s Flash-Lite call,
+    measured on the tool-sort A/B sheets. The tool server handles one request
+    at a time.
+    """
+    key = (project_id, region)
+    client = _VERTEX_CLIENTS.get(key)
+    if client is None:
+        client = genai_mod.Client(vertexai=True, project=project_id, location=region)
+        _VERTEX_CLIENTS[key] = client
+    return client
+
+
 def _query_vertex(prompt: str, images: list[np.ndarray], model: str | None) -> str:
     model = _resolve_model(model)
     if _is_claude_model(model):
@@ -265,7 +305,7 @@ def _query_vertex(prompt: str, images: list[np.ndarray], model: str | None) -> s
             "(google-genai is declared in tools/vlm/pyproject.toml).",
         ) from exc
 
-    client = genai.Client(vertexai=True, project=project_id, location=region)
+    client = _vertex_client(genai, project_id, region)
     parts: list = [prompt]
     for arr in images:
         parts.append(types.Part.from_bytes(
@@ -273,6 +313,7 @@ def _query_vertex(prompt: str, images: list[np.ndarray], model: str | None) -> s
         ))
     config = types.GenerateContentConfig(
         temperature=_TEMPERATURE, max_output_tokens=_MAX_TOKENS,
+        thinking_config=_resolve_thinking(types),
     )
     last_exc: Exception | None = None
     for attempt in range(_MAX_RETRIES):
